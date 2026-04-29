@@ -10,6 +10,9 @@ import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { z } from 'zod';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
+import { MockMemory } from '../../../memory/mock';
+import { parseMemoryRequestContext } from '../../../memory/types';
+import type { InputProcessor } from '../../../processors';
 import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
 import { createDurableAgent } from '../create-durable-agent';
@@ -140,6 +143,41 @@ describe('DurableAgent memory configuration', () => {
       expect(result.resourceId).toBe('user-456');
     });
 
+    it('should provide memory.thread as an object to processInputStep processors', async () => {
+      const seenThreadIds: string[] = [];
+      const memoryContextProcessor: InputProcessor = {
+        id: 'memory-context-processor',
+        processInputStep: async ({ requestContext }) => {
+          const memoryContext = parseMemoryRequestContext(requestContext);
+          if (memoryContext?.thread?.id) {
+            seenThreadIds.push(memoryContext.thread.id);
+          }
+          return {};
+        },
+      };
+
+      const mockMemory = new MockMemory();
+      const baseAgent = new Agent({
+        id: 'memory-context-agent',
+        name: 'Memory Context Agent',
+        instructions: 'Test memory context shape',
+        model: createTextModel('Hello!') as LanguageModelV2,
+        memory: mockMemory,
+        inputProcessors: [memoryContextProcessor],
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      const result = await durableAgent.stream('Hello', {
+        memory: {
+          thread: 'thread-string-for-processor',
+          resource: 'resource-for-processor',
+        },
+      });
+      await expect(result.output.text).resolves.toBe('Hello!');
+
+      expect(seenThreadIds).toContain('thread-string-for-processor');
+    });
+
     it('should handle missing memory options gracefully', async () => {
       const mockModel = createTextModel('Hello!');
 
@@ -155,6 +193,33 @@ describe('DurableAgent memory configuration', () => {
 
       expect(result.threadId).toBeUndefined();
       expect(result.resourceId).toBeUndefined();
+    });
+
+    it('should persist both user input and assistant response after a completed stream', async () => {
+      const mockMemory = new MockMemory();
+      const baseAgent = new Agent({
+        id: 'persist-response-agent',
+        name: 'Persist Response Agent',
+        instructions: 'Test response persistence',
+        model: createTextModel('assistant response') as LanguageModelV2,
+        memory: mockMemory,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      const result = await durableAgent.stream('user input', {
+        memory: { thread: 'thread-persist-response', resource: 'resource-persist-response' },
+      });
+      await expect(result.output.text).resolves.toBe('assistant response');
+
+      const messages = await mockMemory.recall({
+        threadId: 'thread-persist-response',
+        resourceId: 'resource-persist-response',
+      });
+
+      expect(messages.messages.map(message => message.role)).toEqual(['user', 'assistant']);
+      expect(JSON.stringify(messages.messages[0]?.content)).toContain('user input');
+      expect(JSON.stringify(messages.messages[1]?.content)).toContain('assistant response');
+      result.cleanup();
     });
   });
 

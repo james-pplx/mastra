@@ -4,8 +4,11 @@ import { CachingPubSub } from '../../events/caching-pubsub';
 import { EventEmitterPubSub } from '../../events/event-emitter';
 import type { PubSub } from '../../events/pubsub';
 import type { Mastra } from '../../mastra';
+import type { MastraMemory } from '../../memory/memory';
 import type { MastraModelOutput } from '../../stream/base/output';
 import type { ChunkType } from '../../stream/types';
+import type { DynamicArgument } from '../../types';
+import type { AnyWorkspace } from '../../workspace';
 import { Agent } from '../agent';
 import type { AgentExecutionOptions } from '../agent.types';
 import type { MessageListInput } from '../message-list';
@@ -21,7 +24,12 @@ import type {
   AgentFinishEventData,
   AgentStepFinishEventData,
   AgentSuspendedEventData,
+  DurableAgentActiveRun,
+  DurableAgentClaimThreadOptions,
+  DurableAgentClaimThreadResult,
   DurableAgenticWorkflowInput,
+  DurableAgentSignal,
+  SendDurableAgentSignalOptions,
 } from './types';
 import { createDurableAgenticWorkflow } from './workflows';
 
@@ -246,8 +254,8 @@ export class DurableAgent<
       name: agentName,
       // Delegate to wrapped agent's instructions
       instructions: ({ requestContext }) => agent.getInstructions({ requestContext }),
-      // We need to provide model to satisfy the base class, but we'll delegate to wrapped agent
-      model: (agent as any).__model ?? agent.getModel(),
+      // Provide a lazy model resolver so wrapping dynamic agents doesn't resolve the model at construction time.
+      model: ({ requestContext }) => agent.getModel({ requestContext }),
     });
 
     this.#wrappedAgent = agent;
@@ -280,6 +288,51 @@ export class DurableAgent<
   get pubsub(): PubSub {
     this.#ensurePubsubInitialized();
     return this.#cachingPubsub!;
+  }
+
+  getActiveRunForThread(options: { resourceId: string; threadId: string }): DurableAgentActiveRun | undefined {
+    const runId = this.#runRegistry.getRunIdForThread(options.resourceId, options.threadId);
+    if (!runId) return undefined;
+    const status = this.#runRegistry.getStatus(runId);
+    if (!status || status === 'completed' || status === 'error') return undefined;
+    return { ...options, runId, status };
+  }
+
+  claimThreadRun(options: DurableAgentClaimThreadOptions): DurableAgentClaimThreadResult {
+    const activeRun = this.getActiveRunForThread({ resourceId: options.resourceId, threadId: options.threadId });
+    if (activeRun) {
+      return { claimed: false, activeRun };
+    }
+    return {
+      claimed: true,
+      activeRun: {
+        resourceId: options.resourceId,
+        threadId: options.threadId,
+        runId: options.runId,
+        ownerId: options.ownerId,
+        status: 'active',
+      },
+    };
+  }
+
+  sendSignal(signal: DurableAgentSignal, target: SendDurableAgentSignalOptions): { accepted: true; runId: string } {
+    let runId: string | undefined;
+    if (target.runId) {
+      runId = target.runId;
+    } else if (target.resourceId && target.threadId) {
+      runId = this.#runRegistry.getRunIdForThread(target.resourceId, target.threadId);
+    }
+    if (!runId) {
+      throw new Error('No active durable agent run found for signal target');
+    }
+
+    this.#runRegistry.enqueueSignal(runId, signal);
+    const globalEntry = globalRunRegistry.get(runId);
+    if (globalEntry) {
+      globalEntry.signalQueue ??= [];
+      globalEntry.signalQueue.push(signal);
+    }
+    return { accepted: true, runId };
   }
 
   /**
@@ -347,8 +400,43 @@ export class DurableAgent<
     return this.#wrappedAgent.listTools(options);
   }
 
-  override getMemory() {
-    return this.#wrappedAgent.getMemory();
+  override hasOwnMemory() {
+    return this.#wrappedAgent.hasOwnMemory();
+  }
+
+  override getMemory(options?: any) {
+    return this.#wrappedAgent.getMemory(options);
+  }
+
+  override __setMemory(memory: DynamicArgument<MastraMemory, any>) {
+    this.#wrappedAgent.__setMemory(memory);
+    super.__setMemory(memory);
+  }
+
+  override hasOwnWorkspace() {
+    return this.#wrappedAgent.hasOwnWorkspace();
+  }
+
+  override getWorkspace(options?: any) {
+    return this.#wrappedAgent.getWorkspace(options);
+  }
+
+  override __setWorkspace(workspace: DynamicArgument<AnyWorkspace | undefined, any>) {
+    this.#wrappedAgent.__setWorkspace(workspace);
+    super.__setWorkspace(workspace);
+  }
+
+  override hasOwnBrowser() {
+    return this.#wrappedAgent.hasOwnBrowser();
+  }
+
+  override get browser() {
+    return this.#wrappedAgent.browser;
+  }
+
+  override setBrowser(browser: Parameters<Agent['setBrowser']>[0]) {
+    this.#wrappedAgent.setBrowser(browser);
+    super.setBrowser(browser);
   }
 
   override getVoice() {
@@ -389,8 +477,16 @@ export class DurableAgent<
    */
   protected async executeWorkflow(runId: string, workflowInput: DurableAgenticWorkflowInput): Promise<void> {
     const workflow = this.getWorkflow();
-    const requestContext = globalRunRegistry.get(runId)?.requestContext;
-    const result = await this.#executor.execute(workflow, workflowInput, this.pubsub, runId, requestContext);
+    const registryEntry = globalRunRegistry.get(runId);
+    const requestContext = registryEntry?.requestContext;
+    const result = await this.#executor.execute(
+      workflow,
+      workflowInput,
+      this.pubsub,
+      runId,
+      requestContext,
+      registryEntry?.abortSignal,
+    );
 
     if (!result.success && result.error) {
       await this.emitError(runId, result.error);
@@ -487,20 +583,28 @@ export class DurableAgent<
       onChunk: options?.onChunk,
       onStepFinish: options?.onStepFinish,
       onFinish: async result => {
+        this.#runRegistry.setStatus(runId, 'completed');
         await options?.onFinish?.(result);
         scheduleAutoCleanup();
       },
       onError: async error => {
+        this.#runRegistry.setStatus(runId, 'error');
         await options?.onError?.(error);
         scheduleAutoCleanup();
       },
-      onSuspended: options?.onSuspended,
+      onSuspended: async data => {
+        this.#runRegistry.setStatus(runId, 'suspended');
+        await options?.onSuspended?.(data);
+      },
     });
 
     // 4. Wait for subscription to be ready, then execute workflow
     // This prevents race conditions where events are published before subscription
     ready
-      .then(() => this.executeWorkflow(runId, workflowInput))
+      .then(() => {
+        return this.executeWorkflow(runId, workflowInput);
+      })
+      .then(() => {})
       .catch(error => {
         void this.emitError(runId, error);
       });
@@ -602,9 +706,12 @@ export class DurableAgent<
 
     // Wait for subscription to be ready, then resume workflow
     const workflow = this.getWorkflow();
-    const requestContext = globalRunRegistry.get(runId)?.requestContext;
+    const registryEntry = globalRunRegistry.get(runId);
+    const requestContext = registryEntry?.requestContext;
     ready
-      .then(() => this.#executor.resume(workflow, this.pubsub, runId, resumeData, requestContext))
+      .then(() =>
+        this.#executor.resume(workflow, this.pubsub, runId, resumeData, requestContext, registryEntry?.abortSignal),
+      )
       .then(result => {
         if (!result.success && result.error) {
           void this.emitError(runId, result.error);

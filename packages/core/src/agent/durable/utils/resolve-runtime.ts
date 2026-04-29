@@ -183,7 +183,7 @@ export function resolveModel(config: SerializableModelConfig, _mastra?: Mastra):
     modelId: config.modelId,
     specificationVersion: config.specificationVersion ?? 'v2',
     __metadataOnly: true,
-  } as MastraLanguageModel;
+  } as unknown as MastraLanguageModel;
 }
 
 /**

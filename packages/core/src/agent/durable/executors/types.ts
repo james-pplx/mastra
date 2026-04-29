@@ -38,6 +38,7 @@ export interface WorkflowExecutor {
     pubsub: PubSub,
     runId: string,
     requestContext?: RequestContext,
+    abortSignal?: AbortSignal,
   ): Promise<WorkflowExecutionResult>;
 
   /**
@@ -56,5 +57,6 @@ export interface WorkflowExecutor {
     runId: string,
     resumeData: unknown,
     requestContext?: RequestContext,
+    abortSignal?: AbortSignal,
   ): Promise<WorkflowExecutionResult>;
 }

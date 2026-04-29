@@ -3,6 +3,12 @@ import type { RequestContext } from '../../../request-context';
 import type { DurableAgenticWorkflowInput } from '../types';
 import type { WorkflowExecutor, WorkflowExecutionResult } from './types';
 
+function createAbortError(): Error {
+  const error = new Error('The operation was aborted.');
+  error.name = 'AbortError';
+  return error;
+}
+
 /**
  * Local workflow executor.
  *
@@ -24,26 +30,46 @@ export class LocalWorkflowExecutor implements WorkflowExecutor {
     pubsub: PubSub,
     runId: string,
     requestContext?: RequestContext,
+    abortSignal?: AbortSignal,
   ): Promise<WorkflowExecutionResult> {
     try {
       // Create a run and start it, passing pubsub for streaming
       const run = await workflow.createRun({ runId, pubsub });
-      const result = await run.start({ inputData: input, requestContext });
-
-      // Check for errors in result
-      if (result?.status === 'failed') {
-        return {
-          success: false,
-          status: 'failed',
-          error: new Error((result as any).error?.message || 'Workflow execution failed'),
-        };
+      if (abortSignal?.aborted) {
+        await run.cancel();
+        return { success: false, status: 'canceled', error: createAbortError() };
       }
-
-      return {
-        success: true,
-        status: result?.status || 'completed',
+      const abort = () => {
+        void run.cancel();
       };
+      abortSignal?.addEventListener('abort', abort, { once: true });
+      try {
+        const result = await run.start({ inputData: input, requestContext });
+
+        // Check for errors in result
+        if (result?.status === 'failed') {
+          return {
+            success: false,
+            status: 'failed',
+            error: new Error((result as any).error?.message || 'Workflow execution failed'),
+          };
+        }
+
+        if (result?.status === 'canceled' || abortSignal?.aborted) {
+          return { success: false, status: 'canceled', error: createAbortError() };
+        }
+
+        return {
+          success: true,
+          status: result?.status || 'completed',
+        };
+      } finally {
+        abortSignal?.removeEventListener('abort', abort);
+      }
     } catch (error) {
+      if (abortSignal?.aborted) {
+        return { success: false, status: 'canceled', error: createAbortError() };
+      }
       return {
         success: false,
         status: 'error',
@@ -65,24 +91,44 @@ export class LocalWorkflowExecutor implements WorkflowExecutor {
     runId: string,
     resumeData: unknown,
     requestContext?: RequestContext,
+    abortSignal?: AbortSignal,
   ): Promise<WorkflowExecutionResult> {
     try {
       const run = await workflow.createRun({ runId, pubsub });
-      const result = await run.resume({ resumeData, requestContext });
-
-      if (result?.status === 'failed') {
-        return {
-          success: false,
-          status: 'failed',
-          error: new Error((result as any).error?.message || 'Workflow resume failed'),
-        };
+      if (abortSignal?.aborted) {
+        await run.cancel();
+        return { success: false, status: 'canceled', error: createAbortError() };
       }
-
-      return {
-        success: true,
-        status: result?.status || 'completed',
+      const abort = () => {
+        void run.cancel();
       };
+      abortSignal?.addEventListener('abort', abort, { once: true });
+      try {
+        const result = await run.resume({ resumeData, requestContext });
+
+        if (result?.status === 'failed') {
+          return {
+            success: false,
+            status: 'failed',
+            error: new Error((result as any).error?.message || 'Workflow resume failed'),
+          };
+        }
+
+        if (result?.status === 'canceled' || abortSignal?.aborted) {
+          return { success: false, status: 'canceled', error: createAbortError() };
+        }
+
+        return {
+          success: true,
+          status: result?.status || 'completed',
+        };
+      } finally {
+        abortSignal?.removeEventListener('abort', abort);
+      }
     } catch (error) {
+      if (abortSignal?.aborted) {
+        return { success: false, status: 'canceled', error: createAbortError() };
+      }
       return {
         success: false,
         status: 'error',
