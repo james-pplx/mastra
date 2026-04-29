@@ -59,7 +59,10 @@ export const requestSandboxAccessTool = createTool({
       // Create a promise that resolves when the user answers in the TUI
       const answer = await new Promise<string>(resolve => {
         // Register the resolver so respondToQuestion() can resolve it
-        harnessCtx.registerQuestion!({ questionId, resolve });
+        harnessCtx.registerQuestion!({
+          questionId,
+          resolve: value => resolve(Array.isArray(value) ? value.join(',') : value),
+        });
 
         // Emit event — TUI will show the dialog
         harnessCtx.emitEvent!({
