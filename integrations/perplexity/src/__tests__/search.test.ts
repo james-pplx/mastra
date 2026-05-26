@@ -22,6 +22,12 @@ function jsonResponse(body: unknown, status = 200) {
   });
 }
 
+function expectAttributionHeader(init: RequestInit) {
+  expect(init.headers).toMatchObject({
+    'X-Pplx-Integration': expect.stringMatching(/^mastra\/.+/),
+  });
+}
+
 describe('createPerplexitySearchTool', () => {
   it('exposes the expected tool id, description, and schemas', () => {
     const tool = createPerplexitySearchTool({ apiKey: 'k' });
@@ -58,6 +64,7 @@ describe('createPerplexitySearchTool', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [, init] = fetchMock.mock.calls[0]!;
+    expectAttributionHeader(init as RequestInit);
     expect(JSON.parse((init as RequestInit).body as string)).toEqual({
       query: 'agent frameworks',
       max_results: 5,
@@ -80,6 +87,7 @@ describe('createPerplexitySearchTool', () => {
 
     const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
     expect(body).toEqual({ query: 'q' });
+    expectAttributionHeader(fetchMock.mock.calls[0]![1] as RequestInit);
   });
 
   it('returns an empty results array when the API returns none', async () => {
@@ -88,6 +96,7 @@ describe('createPerplexitySearchTool', () => {
 
     const out = (await tool.execute!({ query: 'q' }, {} as any)) as { results: unknown[] };
     expect(out.results).toEqual([]);
+    expectAttributionHeader(fetchMock.mock.calls[0]![1] as RequestInit);
   });
 
   it('lets API errors propagate to the caller', async () => {
@@ -95,6 +104,7 @@ describe('createPerplexitySearchTool', () => {
     const tool = createPerplexitySearchTool({ apiKey: 'k', fetch: fetchMock });
 
     await expect(tool.execute!({ query: 'q' }, {} as any)).rejects.toThrow(/403/);
+    expectAttributionHeader(fetchMock.mock.calls[0]![1] as RequestInit);
   });
 
   it('truncates long error response bodies to 1000 chars', async () => {
@@ -105,6 +115,7 @@ describe('createPerplexitySearchTool', () => {
     await expect(tool.execute!({ query: 'q' }, {} as any)).rejects.toThrow(
       new RegExp(`status 500: x{1000}…$`),
     );
+    expectAttributionHeader(fetchMock.mock.calls[0]![1] as RequestInit);
   });
 
   it('rejects searchDomainFilter that mixes allow and deny entries', async () => {

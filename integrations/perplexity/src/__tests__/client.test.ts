@@ -2,6 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { perplexitySearchRequest } from '../client.js';
 
+function expectAttributionHeader(init: RequestInit) {
+  expect(init.headers).toMatchObject({
+    'X-Pplx-Integration': expect.stringMatching(/^mastra\/.+/),
+  });
+}
+
 describe('perplexitySearchRequest', () => {
   const ORIGINAL_ENV = { ...process.env };
 
@@ -34,6 +40,7 @@ describe('perplexitySearchRequest', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [, init] = fetchMock.mock.calls[0]!;
     expect((init as RequestInit).headers).toMatchObject({ Authorization: 'Bearer env-key' });
+    expectAttributionHeader(init as RequestInit);
   });
 
   it('explicit apiKey overrides environment variables', async () => {
@@ -47,6 +54,7 @@ describe('perplexitySearchRequest', () => {
 
     const [, init] = fetchMock.mock.calls[0]!;
     expect((init as RequestInit).headers).toMatchObject({ Authorization: 'Bearer explicit-key' });
+    expectAttributionHeader(init as RequestInit);
   });
 
   it('posts to /search at the configured base URL with the request body', async () => {
@@ -69,6 +77,7 @@ describe('perplexitySearchRequest', () => {
     const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe('https://example.test/search');
     expect((init as RequestInit).method).toBe('POST');
+    expectAttributionHeader(init as RequestInit);
     expect(JSON.parse((init as RequestInit).body as string)).toEqual({
       query: 'mastra agent framework',
       max_results: 7,
@@ -85,6 +94,7 @@ describe('perplexitySearchRequest', () => {
     await expect(
       perplexitySearchRequest({ query: 'q' }, { apiKey: 'k', fetch: fetchMock }),
     ).rejects.toThrow(/429.*rate limited/);
+    expectAttributionHeader(fetchMock.mock.calls[0]![1] as RequestInit);
   });
 
   it('normalizes a missing results field to an empty array', async () => {
@@ -98,5 +108,6 @@ describe('perplexitySearchRequest', () => {
     );
 
     expect(out).toEqual({ id: 'r', results: [] });
+    expectAttributionHeader(fetchMock.mock.calls[0]![1] as RequestInit);
   });
 });

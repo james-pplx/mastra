@@ -1,4 +1,7 @@
+import pkgJson from '../package.json';
+
 export const DEFAULT_BASE_URL = 'https://api.perplexity.ai';
+const PPLX_INTEGRATION_HEADER = `mastra/${pkgJson.version}`;
 
 export type PerplexityClientOptions = {
   /**
@@ -62,6 +65,7 @@ export async function perplexitySearchRequest(
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`,
+      'X-Pplx-Integration': PPLX_INTEGRATION_HEADER,
     },
     body: JSON.stringify(body),
   });
