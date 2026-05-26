@@ -41,14 +41,14 @@ const researchAgent = new Agent({
   id: 'research-agent',
   // highlight-next-line
   description: 'Gathers factual information and returns bullet-point summaries.',
-  model: 'openai/gpt-5-mini',
+  model: '__GATEWAY_OPENAI_MODEL_MINI__',
 })
 
 const writingAgent = new Agent({
   id: 'writing-agent',
   // highlight-next-line
   description: 'Transforms research into well-structured articles.',
-  model: 'openai/gpt-5-mini',
+  model: '__GATEWAY_OPENAI_MODEL_MINI__',
 })
 
 // highlight-start
@@ -56,7 +56,7 @@ const supervisor = new Agent({
   id: 'supervisor',
   instructions: `You coordinate research and writing using specialized agents.
     Delegate to research-agent for facts, then writing-agent for content.`,
-  model: 'openai/gpt-5.4',
+  model: '__GATEWAY_OPENAI_MODEL__',
   agents: { researchAgent, writingAgent },
   memory: new Memory({
     storage: new LibSQLStore({ id: 'storage', url: 'file:mastra.db' }),
@@ -182,6 +182,22 @@ const stream = await supervisor.stream('Research AI trends', {
 ```
 
 The callback receives `messages` (the full conversation history), `primitiveId` (the subagent ID), and `prompt` (the delegation prompt). Return the filtered array of messages.
+
+## Subagent result context
+
+When a subagent completes, the supervisor model receives the subagent's text response in later iterations. Nested tool calls and subagent metadata, such as thread and resource IDs, are not added to the supervisor model context.
+
+Application code and UI integrations can still inspect the raw delegation result, including `subAgentToolResults`, from the tool result payload. This keeps debugging and display data available without sending nested tool arguments or outputs back into the supervisor's next model call.
+
+Set `includeSubAgentToolResultsInModelContext` to include the full subagent result, including nested tool results and subagent metadata, in the supervisor model context.
+
+```typescript title="src/mastra/agents/supervisor.ts"
+await supervisor.generate('Research AI trends', {
+  delegation: {
+    includeSubAgentToolResultsInModelContext: true,
+  },
+})
+```
 
 ## Iteration monitoring
 
@@ -330,7 +346,7 @@ Enable the [backgroundTasks manager](/reference/configuration#backgroundtasks) o
 const supervisor = new Agent({
   id: 'supervisor',
   instructions: 'Coordinate research and writing using the available agents.',
-  model: 'openai/gpt-5.4',
+  model: '__GATEWAY_OPENAI_MODEL__',
   agents: { researchAgent, writingAgent },
   // highlight-start
   backgroundTasks: {
@@ -366,12 +382,12 @@ const result = await supervisor.generate('Research and write about AI safety', {
 })
 ```
 
-Version overrides propagate automatically through delegation. See [Subagent versioning](/docs/editor/overview#subagent-versioning) for details on resolution order and server API usage.
+Version overrides propagate automatically through delegation. See [Subagent versioning](/docs/editor/overview#sub-agent-versioning) for details on resolution order and server API usage.
 
 ## Related
 
 - [Background tasks](./background-tasks)
-- [Subagent versioning](/docs/editor/overview#subagent-versioning)
+- [Subagent versioning](/docs/editor/overview#sub-agent-versioning)
 - [Guide: Research coordinator](/guides/guide/research-coordinator)
 - [Agent.stream() reference](/reference/streaming/agents/stream)
 - [Agent.streamUntilIdle() reference](/reference/streaming/agents/streamUntilIdle)

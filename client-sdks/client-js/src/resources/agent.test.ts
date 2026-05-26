@@ -4,7 +4,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v3';
 
 import { MastraClient } from '../client';
-import type { ClientOptions } from '../types';
+import type { Body } from '../route-types.generated';
+import type { ClientOptions, SendAgentSignalParams, SubscribeAgentThreadParams } from '../types';
 import { processClientTools } from '../utils/process-client-tools';
 import { zodToJsonSchema } from '../utils/zod-to-json-schema';
 import { Agent } from './agent';
@@ -22,6 +23,195 @@ class TestAgent extends Agent {
     }) as Promise<Response>;
   }
 }
+
+describe('Agent signal routes', () => {
+  const mockClientOptions = {
+    baseUrl: 'http://localhost:4111',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer test-key',
+      'x-mastra-client-type': 'js',
+    },
+  };
+
+  it('sends run-targeted signals with active behavior unchanged', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue({ accepted: true, runId: 'run-123' });
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const params = {
+      signal: { type: 'user-message', contents: 'pause here' },
+      runId: 'run-123',
+      ifActive: { behavior: 'persist' },
+    } as SendAgentSignalParams;
+    const routeBody: Body<'POST /agents/:agentId/signals'> = params;
+
+    await agent.sendSignal(params);
+
+    expect(mockRequest).toHaveBeenCalledWith('/agents/test-agent/signals', {
+      method: 'POST',
+      body: routeBody,
+    });
+  });
+
+  it('sends thread-targeted signals with active and idle behavior unchanged', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue({ accepted: true, runId: 'run-123' });
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const params = {
+      signal: { type: 'system-reminder', contents: '<system-reminder>review PR comment</system-reminder>' },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifActive: { behavior: 'discard' },
+      ifIdle: {
+        behavior: 'wake',
+        streamOptions: {
+          maxSteps: 3,
+          instructions: 'Use the PR context.',
+        },
+      },
+    } as SendAgentSignalParams;
+    const routeBody: Body<'POST /agents/:agentId/signals'> = params;
+
+    await agent.sendSignal(params);
+
+    expect(mockRequest).toHaveBeenCalledWith('/agents/test-agent/signals', {
+      method: 'POST',
+      body: routeBody,
+    });
+  });
+
+  it('subscribes to threads with the same body shape as the server route', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const response = new Response(new ReadableStream());
+    const mockRequest = vi.fn().mockResolvedValue(response);
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const params = {
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } satisfies SubscribeAgentThreadParams;
+    const routeBody: Body<'POST /agents/:agentId/threads/subscribe'> = params;
+
+    await agent.subscribeToThread(params);
+
+    expect(mockRequest).toHaveBeenCalledWith('/agents/test-agent/threads/subscribe', {
+      method: 'POST',
+      body: routeBody,
+      stream: true,
+    });
+  });
+
+  it('can reconnect when processing a thread subscription stream ends', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const firstChunk = { type: 'text-delta', runId: 'run-1', from: 'AGENT', payload: { id: 'text-1', text: 'first' } };
+    const secondChunk = {
+      type: 'text-delta',
+      runId: 'run-2',
+      from: 'AGENT',
+      payload: { id: 'text-2', text: 'second' },
+    };
+    const encode = (chunk: unknown) => new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`);
+    const mockRequest = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(encode(firstChunk));
+              controller.close();
+            },
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(encode(secondChunk));
+              controller.close();
+            },
+          }),
+        ),
+      );
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const response = await agent.subscribeToThread({ resourceId: 'resource-123', threadId: 'thread-123' });
+    const onChunk = vi.fn().mockResolvedValue(undefined);
+
+    await response.processDataStream({ onChunk, reconnect: { maxRetries: 1, delayMs: 0 } });
+
+    expect(mockRequest).toHaveBeenCalledTimes(2);
+    expect(onChunk).toHaveBeenNthCalledWith(1, firstChunk);
+    expect(onChunk).toHaveBeenNthCalledWith(2, secondChunk);
+  });
+
+  it('does not reconnect when the onChunk callback throws', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const firstChunk = { type: 'text-delta', runId: 'run-1', from: 'AGENT', payload: { id: 'text-1', text: 'first' } };
+    const encode = (chunk: unknown) => new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`);
+    const mockRequest = vi.fn().mockResolvedValue(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(encode(firstChunk));
+            controller.close();
+          },
+        }),
+      ),
+    );
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const response = await agent.subscribeToThread({ resourceId: 'resource-123', threadId: 'thread-123' });
+    const callbackError = new Error('boom from onChunk');
+    const onChunk = vi.fn().mockRejectedValue(callbackError);
+
+    // Consumer should receive the original error they threw, unwrapped.
+    await expect(response.processDataStream({ onChunk, reconnect: { maxRetries: 5, delayMs: 0 } })).rejects.toBe(
+      callbackError,
+    );
+
+    expect(mockRequest).toHaveBeenCalledTimes(1);
+    expect(onChunk).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries failed resubscribe requests within the reconnect limit', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const firstChunk = { type: 'text-delta', runId: 'run-1', from: 'AGENT', payload: { id: 'text-1', text: 'first' } };
+    const secondChunk = {
+      type: 'text-delta',
+      runId: 'run-2',
+      from: 'AGENT',
+      payload: { id: 'text-2', text: 'second' },
+    };
+    const encode = (chunk: unknown) => new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`);
+    const responseFor = (chunk: unknown) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(encode(chunk));
+            controller.close();
+          },
+        }),
+      );
+    const mockRequest = vi
+      .fn()
+      .mockResolvedValueOnce(responseFor(firstChunk))
+      .mockRejectedValueOnce(new Error('temporary reconnect failure'))
+      .mockResolvedValueOnce(responseFor(secondChunk));
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const response = await agent.subscribeToThread({ resourceId: 'resource-123', threadId: 'thread-123' });
+    const onChunk = vi.fn();
+
+    await response.processDataStream({ onChunk, reconnect: { maxRetries: 2, delayMs: 0 } });
+
+    expect(mockRequest).toHaveBeenCalledTimes(3);
+    expect(onChunk).toHaveBeenNthCalledWith(1, firstChunk);
+    expect(onChunk).toHaveBeenNthCalledWith(2, secondChunk);
+  });
+});
 
 describe('Agent.stream', () => {
   const mockClientOptions = {
@@ -97,6 +287,38 @@ describe('Agent.stream', () => {
 
     const requestBody = mockRequest.mock.calls[0][1].body;
     expect(requestBody.clientTools).toEqual(processClientTools(clientTools));
+  });
+
+  it('should handle vNext step-finish and finish chunks without stepResult payloads', async () => {
+    const encoder = new TextEncoder();
+    const chunks = [{ type: 'text-delta', payload: { text: 'hello' } }, { type: 'step-finish' }, { type: 'finish' }];
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+        }
+        controller.close();
+      },
+    });
+    const updates: any[] = [];
+    const onFinish = vi.fn();
+    const agent = new TestAgent(mockClientOptions, 'test-agent');
+
+    await expect(
+      (agent as any).processChatResponse_vNext({
+        stream,
+        update: (update: any) => updates.push(update),
+        onFinish,
+        lastMessage: undefined,
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(updates[updates.length - 1].message.content).toBe('hello');
+    expect(onFinish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        finishReason: 'unknown',
+      }),
+    );
   });
 });
 
@@ -498,13 +720,12 @@ describe('Agent Client Methods', () => {
     const result = await agent.listVersions({
       page: 0,
       perPage: 10,
-      orderBy: 'createdAt',
-      sortDirection: 'DESC',
+      orderBy: { field: 'createdAt', direction: 'DESC' },
     });
 
     expect(result).toEqual(mockResponse);
     expect(global.fetch).toHaveBeenCalledWith(
-      `${clientOptions.baseUrl}/api/stored/agents/test-agent/versions?page=0&perPage=10&orderBy=createdAt&sortDirection=DESC`,
+      `${clientOptions.baseUrl}/api/stored/agents/test-agent/versions?page=0&perPage=10&orderBy%5Bfield%5D=createdAt&orderBy%5Bdirection%5D=DESC`,
       expect.objectContaining({
         headers: expect.objectContaining(clientOptions.headers),
       }),
@@ -877,5 +1098,310 @@ describe('streaming behavior', () => {
     });
 
     expect(chunks).toHaveLength(1);
+  });
+});
+
+describe('Agent.processStreamResponse client-tool synthetic chunks', () => {
+  const mockClientOptions: ClientOptions = {
+    baseUrl: 'https://api.test.com',
+  };
+
+  function makeStreamingResponse(chunks: unknown[]): Response {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+        }
+        controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
+        controller.close();
+      },
+    });
+    return new Response(body, { status: 200 });
+  }
+
+  async function readAllText(stream: ReadableStream<Uint8Array>): Promise<string> {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let out = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) out += decoder.decode(value, { stream: true });
+    }
+    out += decoder.decode();
+    return out;
+  }
+
+  function parseSseDataLines(raw: string): any[] {
+    return raw
+      .split('\n\n')
+      .map(line => line.trim())
+      .filter(line => line.startsWith('data:'))
+      .map(line => line.slice('data:'.length).trim())
+      .filter(payload => payload && payload !== '[DONE]')
+      .map(payload => JSON.parse(payload));
+  }
+
+  it('emits a synthetic tool-result chunk into the controller after a client tool resolves', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent-id');
+
+    const toolCallId = 'tool-call-1';
+    const firstResponse = makeStreamingResponse([
+      { type: 'step-start', payload: { messageId: 'msg-1' } },
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId,
+          toolName: 'testTool',
+          args: { x: 1 },
+        },
+      },
+      {
+        type: 'finish',
+        payload: { stepResult: { reason: 'tool-calls' } },
+      },
+    ]);
+    // Second (recursive) call: a simple finish-stop response.
+    const secondResponse = makeStreamingResponse([
+      { type: 'step-start', payload: { messageId: 'msg-2' } },
+      { type: 'text-delta', payload: { text: 'done' } },
+      { type: 'finish', payload: { stepResult: { reason: 'stop' } } },
+    ]);
+
+    const mockRequest = vi.fn().mockResolvedValueOnce(firstResponse).mockResolvedValueOnce(secondResponse);
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const executeMock = vi.fn().mockResolvedValue({ ok: true, n: 42 });
+    const clientTools = {
+      testTool: {
+        id: 'testTool',
+        description: 'A test tool',
+        execute: executeMock,
+      },
+    };
+
+    let outerController!: ReadableStreamDefaultController<Uint8Array>;
+    const outerStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        outerController = controller;
+      },
+    });
+
+    const processPromise = agent.processStreamResponse(
+      {
+        messages: [{ role: 'user', content: 'hi' }],
+        clientTools,
+        runId: 'run-xyz',
+      },
+      outerController,
+    );
+
+    const captured = await readAllText(outerStream);
+    await processPromise;
+
+    expect(executeMock).toHaveBeenCalledTimes(1);
+    expect(executeMock.mock.calls[0]![0]).toEqual({ x: 1 });
+
+    const parsed = parseSseDataLines(captured);
+    const synthetic = parsed.find(chunk => chunk?.type === 'tool-result' && chunk?.payload?.toolCallId === toolCallId);
+    expect(synthetic).toBeDefined();
+    expect(synthetic).toMatchObject({
+      type: 'tool-result',
+      runId: 'run-xyz',
+      from: 'AGENT',
+      payload: {
+        toolCallId,
+        toolName: 'testTool',
+        result: { ok: true, n: 42 },
+        isError: false,
+        providerExecuted: false,
+      },
+    });
+
+    // The synthetic chunk should appear after the server-side `finish` chunk
+    // (we await pipePromise before enqueuing it).
+    const finishIdx = parsed.findIndex(chunk => chunk?.type === 'finish');
+    const toolResultIdx = parsed.findIndex(
+      chunk => chunk?.type === 'tool-result' && chunk?.payload?.toolCallId === toolCallId,
+    );
+    expect(finishIdx).toBeGreaterThanOrEqual(0);
+    expect(toolResultIdx).toBeGreaterThan(finishIdx);
+
+    // And the recursive call must have happened.
+    expect(mockRequest).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses the observed stream runId for synthetic chunks on the public stream API', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent-id');
+
+    const toolCallId = 'tool-call-public';
+    const firstResponse = makeStreamingResponse([
+      { type: 'step-start', runId: 'actual-run-id', payload: { messageId: 'msg-1' } },
+      {
+        type: 'tool-call',
+        runId: 'actual-run-id',
+        payload: {
+          toolCallId,
+          toolName: 'testTool',
+          args: { x: 1 },
+        },
+      },
+      {
+        type: 'finish',
+        runId: 'actual-run-id',
+        payload: { stepResult: { reason: 'tool-calls' } },
+      },
+    ]);
+    const secondResponse = makeStreamingResponse([
+      { type: 'step-start', runId: 'continued-run-id', payload: { messageId: 'msg-2' } },
+      { type: 'finish', runId: 'continued-run-id', payload: { stepResult: { reason: 'stop' } } },
+    ]);
+
+    const mockRequest = vi.fn().mockResolvedValueOnce(firstResponse).mockResolvedValueOnce(secondResponse);
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const streamResponse = await agent.stream([{ role: 'user', content: 'hi' }], {
+      clientTools: {
+        testTool: {
+          id: 'testTool',
+          description: 'A test tool',
+          execute: vi.fn().mockResolvedValue({ ok: true }),
+        },
+      },
+    });
+
+    const chunks: any[] = [];
+    await streamResponse.processDataStream({
+      onChunk: async chunk => {
+        chunks.push(chunk);
+      },
+    });
+
+    const synthetic = chunks.find(chunk => chunk?.type === 'tool-result' && chunk?.payload?.toolCallId === toolCallId);
+    expect(synthetic).toMatchObject({
+      type: 'tool-result',
+      runId: 'actual-run-id',
+      from: 'AGENT',
+      payload: {
+        toolCallId,
+        toolName: 'testTool',
+        result: { ok: true },
+      },
+    });
+  });
+
+  it('does not treat final tool-call chunks as streaming partial tool calls', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent-id');
+
+    const stream = makeStreamingResponse([
+      { type: 'step-start', runId: 'run-call', payload: { messageId: 'msg-call' } },
+      {
+        type: 'tool-call',
+        runId: 'run-call',
+        payload: {
+          toolCallId: 'tool-call-final',
+          toolName: 'testTool',
+          args: { x: 1 },
+        },
+      },
+      { type: 'finish', runId: 'run-call', payload: { stepResult: { reason: 'tool-calls' } } },
+    ]).body!;
+
+    const updates: any[] = [];
+    await (agent as any).processChatResponse_vNext({
+      stream,
+      update: (update: any) => updates.push(update),
+      lastMessage: undefined,
+    });
+
+    const message = updates[updates.length - 1].message;
+    expect(message.toolInvocations).toHaveLength(1);
+    expect(message.toolInvocations[0]).toMatchObject({
+      state: 'call',
+      toolCallId: 'tool-call-final',
+      toolName: 'testTool',
+      args: { x: 1 },
+    });
+    expect(message.parts.filter((part: any) => part.type === 'tool-invocation')).toHaveLength(1);
+    expect(message.parts.find((part: any) => part.type === 'tool-invocation').toolInvocation).toMatchObject({
+      state: 'call',
+      toolCallId: 'tool-call-final',
+    });
+  });
+
+  it('emits a synthetic tool-error chunk into the controller when a client tool rejects', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent-id');
+
+    const toolCallId = 'tool-call-err';
+    const firstResponse = makeStreamingResponse([
+      { type: 'step-start', payload: { messageId: 'msg-1' } },
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId,
+          toolName: 'badTool',
+          args: { y: 2 },
+        },
+      },
+      {
+        type: 'finish',
+        payload: { stepResult: { reason: 'tool-calls' } },
+      },
+    ]);
+    const secondResponse = makeStreamingResponse([
+      { type: 'step-start', payload: { messageId: 'msg-2' } },
+      { type: 'finish', payload: { stepResult: { reason: 'stop' } } },
+    ]);
+
+    const mockRequest = vi.fn().mockResolvedValueOnce(firstResponse).mockResolvedValueOnce(secondResponse);
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const executeMock = vi.fn().mockRejectedValue(new Error('boom'));
+    const clientTools = {
+      badTool: {
+        id: 'badTool',
+        description: 'A failing tool',
+        execute: executeMock,
+      },
+    };
+
+    let outerController!: ReadableStreamDefaultController<Uint8Array>;
+    const outerStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        outerController = controller;
+      },
+    });
+
+    const processPromise = agent.processStreamResponse(
+      {
+        messages: [{ role: 'user', content: 'hi' }],
+        clientTools,
+        runId: 'run-err',
+      },
+      outerController,
+    );
+
+    const captured = await readAllText(outerStream);
+    await processPromise;
+
+    const parsed = parseSseDataLines(captured);
+    const synthetic = parsed.find(chunk => chunk?.type === 'tool-error' && chunk?.payload?.toolCallId === toolCallId);
+    expect(synthetic).toBeDefined();
+    expect(synthetic).toMatchObject({
+      type: 'tool-error',
+      runId: 'run-err',
+      from: 'AGENT',
+      payload: {
+        toolCallId,
+        toolName: 'badTool',
+        providerExecuted: false,
+      },
+    });
+    // Error must be serialized as a plain object (not lost as `{}`).
+    expect(synthetic.payload.error).toMatchObject({ name: 'Error', message: 'boom' });
+
+    // Recursive call must still fire with the error result patched in.
+    expect(mockRequest).toHaveBeenCalledTimes(2);
   });
 });
